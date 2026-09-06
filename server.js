@@ -4,38 +4,34 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const crypto = require('crypto');
 
 const app = express();
 
 // ---------- НАСТРОЙКИ (правьте под свой дизайн) ----------
 const CONFIG = {
-  width: 1080,
-  height: 1920,
+  width: 900,
+  height: 1600,
   fps: 30,
   fontFile: '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
 
   // Порядок наложения PNG снизу вверх (имена = имена полей в запросе)
   pngLayers: ['topleft', 'inscription', 'animal', 'item', 'transport'],
 
-  hook:     { fontSize: 60, y: 150,  color: 'white',   box: 'black@0.5', boxborder: 20 },
-  question: { fontSize: 64, y: 380,  color: 'white',   box: 'black@0.55', boxborder: 24 },
+  hook:     { fontSize: 52, y: 120,  color: 'white',   box: 'black@0.5',  boxborder: 18 },
+  question: { fontSize: 54, y: 320,  color: 'white',   box: 'black@0.55', boxborder: 20 },
   answers:  {
-    fontSize: 56,
-    yStart: 900,       // Y первого ответа
-    lineHeight: 170,   // расстояние между ответами
+    fontSize: 48,
+    yStart: 760,       // Y первого ответа
+    lineHeight: 145,   // расстояние между ответами
     color: 'white',
     correctColor: '#00E676',   // зелёный для правильного после reveal
     box: 'black@0.5',
-    boxborder: 20,
+    boxborder: 18,
   },
 };
 // --------------------------------------------------------
 
 const upload = multer({ dest: os.tmpdir() });
-
-// Экранирование только пути к textfile (двоеточия в путях не бывает на linux)
-function q(v) { return String(v); }
 
 // Пишем текст во временный файл — так не нужно экранировать кавычки/апострофы в drawtext
 function writeTextFile(dir, name, text) {
@@ -112,7 +108,7 @@ app.post(
 
       // ---- filter_complex ----
       const fc = [];
-      // База: масштаб/кроп fon до 1080x1920, фиксируем fps и длительность
+      // База: масштаб/кроп fon до размера холста, фиксируем fps и длительность
       fc.push(
         `[0:v]scale=${CONFIG.width}:${CONFIG.height}:force_original_aspect_ratio=increase,` +
         `crop=${CONFIG.width}:${CONFIG.height},fps=${CONFIG.fps},trim=0:${duration},setpts=PTS-STARTPTS[base]`
@@ -123,7 +119,7 @@ app.post(
       pngInputs.forEach((layer, i) => {
         const inIdx = i + 1;               // 0 = fon
         const outLbl = `o${inIdx}`;
-        // PNG считаем full-frame 1080x1920 → overlay 0:0. Приводим к размеру на всякий случай.
+        // PNG приводим к размеру холста и накладываем в 0:0
         fc.push(`[${inIdx}:v]scale=${CONFIG.width}:${CONFIG.height}[p${inIdx}]`);
         fc.push(`[${last}][p${inIdx}]overlay=0:0[${outLbl}]`);
         last = outLbl;
