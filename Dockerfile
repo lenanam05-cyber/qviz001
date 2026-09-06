@@ -1,15 +1,23 @@
-FROM node:18-bullseye-slim
+# ffmpeg уже собран в этом образе — не тянем его через apt
+FROM jrottenberg/ffmpeg:6.1-ubuntu
 
-# ffmpeg + шрифты (DejaVu поддерживает латиницу и кириллицу)
+# ставим Node.js 18
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends --fix-missing \
-       ffmpeg fonts-dejavu-core \
+    && apt-get install -y --no-install-recommends \
+       curl ca-certificates fonts-dejavu-core \
+    && curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
+
 COPY package.json ./
 RUN npm install --omit=dev
+
 COPY . .
 
-ENV PORT=8080
-EXPOSE 8080
+# на всякий случай сбрасываем ENTRYPOINT базового образа (он указывает на ffmpeg)
+ENTRYPOINT []
+
+EXPOSE 3000
 CMD ["node", "server.js"]
