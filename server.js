@@ -20,7 +20,7 @@ const CX = 450;
 const HOOK_CY = 352;          // хук в зоне вопроса (до появления вопроса)
 const Q_CY = 352;             // центр вопроса
 const Q_MAX_W = 560;
-const ANSWER_CY = [811, 916, 1019]; // центры трёх рамок ответов
+const ANSWER_CY = [581, 687, 789]; // центры трёх рамок ответов
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
