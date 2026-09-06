@@ -9,192 +9,215 @@ const app = express();
 const upload = multer({ dest: os.tmpdir() });
 
 const FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
-const W = 900, H = 1600, FPS = 30;
 
-// --- цвет текста: коричневый ---
-const TEXT_COLOR = '0x5A3210';   // коричневый
-const GREEN_COLOR = '0x1E7A1E';  // зелёный для правильного ответа
+// ---- Canvas ----
+const W = 900;
+const H = 1600;
+const FPS = 30;
 
-// --- центры по координатам пользователя (кадр 900x1600) ---
-const CX = 450;
-const HOOK_CY = 352;          // хук в зоне вопроса (до появления вопроса)
-const Q_CY = 352;             // центр вопроса
-const Q_MAX_W = 560;
-const ANSWER_CY = [581, 687, 789]; // центры трёх рамок ответов
+// ---- Colors ----
+const BROWN = '0x5A3210';
+const GREEN = '0x1E7A1E';
+const BORDER = 'white';
+
+// ---- Font sizes (reduced ~15%) ----
+const QUESTION_FONT = 40; // was 46
+const HOOK_FONT = 40;     // was 46
+const ANSWER_FONT = 34;   // was 40
+
+// ---- Layout ----
+const QUESTION_CY = 352;              // center Y of scroll / question zone
+const ANSWER_CY = [581, 687, 789];    // center Y of the 3 answer boxes
+const SIDE_MARGIN = 70;               // left/right padding for wrapping
+const QUESTION_WRAP = 24;             // max chars per line for question/hook
+const ANSWER_WRAP = 22;               // max chars per line for an answer
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-function textWidth(str, fontsize) {
-  return str.length * fontsize * 0.56;
+// Escape text for ffmpeg drawtext text= value
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, '\u2019')  // curly apostrophe avoids quoting issues
+    .replace(/%/g, '\\%')
+    .replace(/\r?\n/g, ' ');
 }
 
-function wrapText(text, maxW, sizes) {
-  for (const fontsize of sizes) {
-    const words = String(text || '').split(/\s+/).filter(Boolean);
-    const lines = [];
-    let cur = '';
-    for (const w of words) {
-      const test = cur ? cur + ' ' + w : w;
-      if (textWidth(test, fontsize) <= maxW) {
-        cur = test;
-      } else {
-        if (cur) lines.push(cur);
-        cur = w;
-      }
-    }
-    if (cur) lines.push(cur);
-    if (lines.length <= 3 && lines.every(l => textWidth(l, fontsize) <= maxW)) {
-      return { lines, fontsize };
-    }
+// Greedy word-wrap into lines of <= maxChars
+function wrap(text, maxChars) {
+  const words = String(text == null ? '' : text).trim().split(/\s+/);
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    if (!cur) { cur = w; continue; }
+    if ((cur + ' ' + w).length <= maxChars) { cur += ' ' + w; }
+    else { lines.push(cur); cur = w; }
   }
-  return { lines: [String(text || '')], fontsize: sizes[sizes.length - 1] };
+  if (cur) lines.push(cur);
+  return lines.length ? lines : [''];
 }
 
-function writeTmp(content) {
-  const p = path.join(os.tmpdir(), 'txt_' + Math.random().toString(36).slice(2) + '.txt');
-  fs.writeFileSync(p, content, 'utf8');
-  return p;
+// Build one drawtext filter segment (no input/output labels)
+function drawtext({ text, fontsize, color, cy, enable }) {
+  const lineH = Math.round(fontsize * 1.28);
+  const lines = Array.isArray(text) ? text : [text];
+  const n = lines.length;
+  const startY = Math.round(cy - (n * lineH) / 2 + lineH / 2);
+  return lines.map((ln, i) => {
+    const y = startY + i * lineH - Math.round(fontsize / 2);
+    return [
+      'drawtext=fontfile=' + FONT,
+      "text='" + esc(ln) + "'",
+      'fontsize=' + fontsize,
+      'fontcolor=' + color,
+      'borderw=3',
+      'bordercolor=' + BORDER,
+      'x=(w-text_w)/2',
+      'y=' + y,
+      "enable='" + enable + "'",
+    ].join(':');
+  });
 }
 
-app.post('/render', upload.fields([
-  { name: 'fon' }, { name: 'topleft' }, { name: 'inscription' },
-  { name: 'animal' }, { name: 'item' }, { name: 'transport' },
-]), (req, res) => {
-  const tmpFiles = [];
-  try {
+app.post(
+  '/render',
+  upload.fields([
+    { name: 'fon', maxCount: 1 },
+    { name: 'topleft', maxCount: 1 },
+    { name: 'inscription', maxCount: 1 },
+    { name: 'animal', maxCount: 1 },
+    { name: 'item', maxCount: 1 },
+    { name: 'transport', maxCount: 1 },
+  ]),
+  (req, res) => {
+    let payload = {};
+    try { payload = JSON.parse(req.body.payload || '{}'); }
+    catch (e) { return res.status(400).json({ error: 'BAD_PAYLOAD', detail: String(e) }); }
+
     const f = req.files || {};
-    const get = (k) => (f[k] && f[k][0] ? f[k][0].path : null);
-    const fon = get('fon');
-    const layers = ['topleft', 'inscription', 'animal', 'item', 'transport'].map(get);
-    if (!fon || layers.some(x => !x)) {
-      return res.status(400).json({ error: 'MISSING_INPUTS' });
+    const need = ['fon', 'topleft', 'inscription', 'animal', 'item', 'transport'];
+    for (const k of need) {
+      if (!f[k] || !f[k][0]) return res.status(400).json({ error: 'MISSING_FILE', field: k });
     }
 
-    let payload = {};
-    try { payload = JSON.parse(req.body.payload || '{}'); } catch (e) { payload = {}; }
+    const t = payload.timings || {};
+    const duration = Number(payload.duration) || Number(t.duration) || 13;
+    const hookStart = Number(t.hook_start != null ? t.hook_start : 0);
+    const questionStart = Number(t.question_start != null ? t.question_start : 3);
+    const answerStart = Number(t.answer_start != null ? t.answer_start : 4);
+    const answerStep = Number(t.answer_step != null ? t.answer_step : 0.3);
+    const revealStart = Number(t.reveal_start != null ? t.reveal_start : 9);
 
     const question = payload.question || '';
     const hook = payload.hook || '';
     const answers = Array.isArray(payload.answers) ? payload.answers : [];
-    const correctPos = Number(payload.correct_answer_position) || 1;
-    const t = payload.timings || {};
-    const duration = Number(t.duration || payload.duration || 13);
-    const hookStart = Number(t.hook_start != null ? t.hook_start : 0);
-    const qStart = Number(t.question_start != null ? t.question_start : 3);
-    const aStart = Number(t.answer_start != null ? t.answer_start : 4);
-    const aStep = Number(t.answer_step != null ? t.answer_step : 0.3);
-    const reveal = Number(t.reveal_start != null ? t.reveal_start : 8);
+    const correctIndex = (Number(payload.correct_answer_position) || 1) - 1;
 
-    // ---- хук (0..qStart) ----
-    const hookWrap = wrapText(hook, Q_MAX_W, [48, 44, 40, 36, 32]);
-    const hookLineH = Math.round(hookWrap.fontsize * 1.18);
-    const hookTotalH = hookWrap.lines.length * hookLineH;
-    const hookStartY = Math.round(HOOK_CY - hookTotalH / 2);
+    const outPath = path.join(os.tmpdir(), 'out_' + Date.now() + '.mp4');
 
-    // ---- вопрос ----
-    const qWrap = wrapText(question, Q_MAX_W, [50, 46, 42, 38, 34, 30]);
-    const qFontsize = qWrap.fontsize;
-    const qLineH = Math.round(qFontsize * 1.18);
-    const qTotalH = qWrap.lines.length * qLineH;
-    const qStartY = Math.round(Q_CY - qTotalH / 2);
+    // ---- Build filter_complex ----
+    const segs = [];
+    // Base: scale fon, then overlay 5 PNG layers (full-frame 900x1600 transparent)
+    segs.push('[0:v]scale=' + W + ':' + H + ',setsar=1,fps=' + FPS + '[b]');
+    segs.push('[b][1:v]overlay=0:0[o1]');
+    segs.push('[o1][2:v]overlay=0:0[o2]');
+    segs.push('[o2][3:v]overlay=0:0[o3]');
+    segs.push('[o3][4:v]overlay=0:0[o4]');
+    segs.push('[o4][5:v]overlay=0:0[o5]');
 
-    // ---- filter_complex ----
-    const parts = [];
-    parts.push(`[0:v]scale=${W}:${H},setsar=1,fps=${FPS}[bg]`);
-    let last = 'bg';
-    for (let i = 0; i < 5; i++) {
-      const inp = i + 1;
-      parts.push(`[${inp}:v]scale=${W}:${H}[l${i}]`);
-      const out = (i === 4) ? 'ov' : `o${i}`;
-      parts.push(`[${last}][l${i}]overlay=0:0:format=auto:eof_action=pass[${out}]`);
-      last = out;
+    // Collect drawtext filters
+    const draws = [];
+
+    // Hook: shown from hookStart until questionStart, in the scroll/question zone
+    if (hook) {
+      draws.push(...drawtext({
+        text: wrap(hook, QUESTION_WRAP),
+        fontsize: HOOK_FONT,
+        color: BROWN,
+        cy: QUESTION_CY,
+        enable: 'between(t,' + hookStart + ',' + questionStart + ')',
+      }));
     }
 
-    let stream = 'ov';
-    let dtIndex = 0;
-    const addDraw = (opts) => {
-      const outName = `d${dtIndex++}`;
-      parts.push(`[${stream}]drawtext=${opts}[${outName}]`);
-      stream = outName;
-    };
+    // Question: from questionStart to end
+    if (question) {
+      draws.push(...drawtext({
+        text: wrap(question, QUESTION_WRAP),
+        fontsize: QUESTION_FONT,
+        color: BROWN,
+        cy: QUESTION_CY,
+        enable: 'gte(t,' + questionStart + ')',
+      }));
+    }
 
-    // хук: показывается с hookStart до qStart
-    hookWrap.lines.forEach((line, i) => {
-      const file = writeTmp(line);
-      tmpFiles.push(file);
-      const y = hookStartY + i * hookLineH;
-      addDraw(
-        `fontfile=${FONT}:textfile=${file}:fontcolor=${TEXT_COLOR}:fontsize=${hookWrap.fontsize}:` +
-        `borderw=3:bordercolor=white@0.85:x=(w-tw)/2:y=${y}:enable='between(t,${hookStart},${qStart})'`
-      );
-    });
+    // Answers
+    for (let i = 0; i < 3; i++) {
+      const ans = answers[i];
+      if (ans == null) continue;
+      const appear = answerStart + i * answerStep;
+      const cy = ANSWER_CY[i] != null ? ANSWER_CY[i] : (581 + i * 106);
+      const wrapped = wrap(ans, ANSWER_WRAP);
 
-    // вопрос: с qStart до конца
-    qWrap.lines.forEach((line, i) => {
-      const file = writeTmp(line);
-      tmpFiles.push(file);
-      const y = qStartY + i * qLineH;
-      addDraw(
-        `fontfile=${FONT}:textfile=${file}:fontcolor=${TEXT_COLOR}:fontsize=${qFontsize}:` +
-        `borderw=3:bordercolor=white@0.85:x=(w-tw)/2:y=${y}:enable='gte(t,${qStart})'`
-      );
-    });
-
-    // ответы
-    const aFontsize = 40;
-    answers.slice(0, 3).forEach((ans, i) => {
-      const file = writeTmp(String(ans));
-      tmpFiles.push(file);
-      const cy = ANSWER_CY[i] != null ? ANSWER_CY[i] : (811 + i * 104);
-      const y = Math.round(cy - aFontsize / 2);
-      const appear = aStart + aStep * i;
-      const isCorrect = (i + 1) === correctPos;
-
-      if (isCorrect) {
-        addDraw(
-          `fontfile=${FONT}:textfile=${file}:fontcolor=${TEXT_COLOR}:fontsize=${aFontsize}:` +
-          `borderw=3:bordercolor=white@0.85:x=(w-tw)/2:y=${y}:enable='between(t,${appear},${reveal})'`
-        );
-        addDraw(
-          `fontfile=${FONT}:textfile=${file}:fontcolor=${GREEN_COLOR}:fontsize=${aFontsize}:` +
-          `borderw=3:bordercolor=white@0.9:x=(w-tw)/2:y=${y}:enable='gte(t,${reveal})'`
-        );
+      if (i === correctIndex) {
+        // brown until reveal, then green
+        draws.push(...drawtext({
+          text: wrapped, fontsize: ANSWER_FONT, color: BROWN, cy,
+          enable: 'between(t,' + appear + ',' + revealStart + ')',
+        }));
+        draws.push(...drawtext({
+          text: wrapped, fontsize: ANSWER_FONT, color: GREEN, cy,
+          enable: 'gte(t,' + revealStart + ')',
+        }));
       } else {
-        addDraw(
-          `fontfile=${FONT}:textfile=${file}:fontcolor=${TEXT_COLOR}:fontsize=${aFontsize}:` +
-          `borderw=3:bordercolor=white@0.85:x=(w-tw)/2:y=${y}:enable='between(t,${appear},${reveal})'`
-        );
+        // wrong answers vanish at reveal
+        draws.push(...drawtext({
+          text: wrapped, fontsize: ANSWER_FONT, color: BROWN, cy,
+          enable: 'between(t,' + appear + ',' + revealStart + ')',
+        }));
       }
+    }
+
+    // Chain drawtext filters after [o5]
+    let prev = 'o5';
+    draws.forEach((d, idx) => {
+      const out = 'd' + idx;
+      segs.push('[' + prev + ']' + d + '[' + out + ']');
+      prev = out;
     });
+    // Ensure a final video label even if no drawtext
+    if (draws.length === 0) {
+      segs.push('[o5]null[vout]');
+      prev = 'vout';
+    } else {
+      // rename last label to vout
+      segs[segs.length - 1] = segs[segs.length - 1].replace('[' + prev + ']', '[vout]');
+      prev = 'vout';
+    }
 
-    parts.push(`[${stream}]null[vout]`);
-    const filter = parts.join(';');
-
-    const outPath = path.join(os.tmpdir(), 'render_' + Date.now() + '.mp4');
-    tmpFiles.push(outPath);
+    const filterComplex = segs.join(';');
 
     const args = [
       '-y',
-      '-i', fon,
-      '-loop', '1', '-i', layers[0],
-      '-loop', '1', '-i', layers[1],
-      '-loop', '1', '-i', layers[2],
-      '-loop', '1', '-i', layers[3],
-      '-loop', '1', '-i', layers[4],
-      '-filter_complex', filter,
+      '-i', f.fon[0].path,
+      '-i', f.topleft[0].path,
+      '-i', f.inscription[0].path,
+      '-i', f.animal[0].path,
+      '-i', f.item[0].path,
+      '-i', f.transport[0].path,
+      '-filter_complex', filterComplex,
       '-map', '[vout]',
       '-map', '0:a?',
-      '-t', String(duration),
+      '-t', String(duration),          // hard cap output length = payload.duration (13)
       '-r', String(FPS),
+      '-pix_fmt', 'yuv420p',
       '-c:v', 'libx264',
       '-preset', 'ultrafast',
       '-threads', '2',
       '-filter_complex_threads', '1',
-      '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
-      '-b:a', '192k',
+      '-b:a', '128k',
       '-movflags', '+faststart',
-      '-shortest',
       outPath,
     ];
 
@@ -204,36 +227,26 @@ app.post('/render', upload.fields([
 
     ff.on('close', (code) => {
       if (code !== 0 || !fs.existsSync(outPath)) {
-        console.error('FFMPEG FAILED, exit code:', code);
-        console.error(stderr);
-        cleanup();
-        return res.status(500).json({ error: 'FFMPEG_FAILED', exitCode: code, stderr: stderr.slice(-4000) });
+        console.error('FFMPEG FAILED code=' + code);
+        console.error(stderr);            // real cause visible in Deploy Logs
+        return res.status(500).json({
+          error: 'FFMPEG_FAILED',
+          exitCode: code,
+          stderr: stderr.slice(-4000),
+        });
       }
       res.setHeader('Content-Type', 'video/mp4');
-      const rs = fs.createReadStream(outPath);
-      rs.pipe(res);
-      rs.on('close', cleanup);
-      rs.on('error', cleanup);
+      const stream = fs.createReadStream(outPath);
+      stream.pipe(res);
+      stream.on('close', () => { try { fs.unlinkSync(outPath); } catch (e) {} });
     });
 
     ff.on('error', (err) => {
-      console.error('FFMPEG SPAWN ERROR:', err);
-      cleanup();
-      res.status(500).json({ error: 'FFMPEG_SPAWN_ERROR', message: String(err) });
+      console.error('SPAWN ERROR', err);
+      res.status(500).json({ error: 'SPAWN_ERROR', detail: String(err) });
     });
-
-    function cleanup() {
-      for (const k of Object.keys(f)) {
-        for (const file of f[k]) { try { fs.unlinkSync(file.path); } catch (e) {} }
-      }
-      for (const p of tmpFiles) { try { fs.unlinkSync(p); } catch (e) {} }
-    }
-  } catch (err) {
-    console.error('HANDLER ERROR:', err);
-    for (const p of tmpFiles) { try { fs.unlinkSync(p); } catch (e) {} }
-    res.status(500).json({ error: 'HANDLER_ERROR', message: String(err) });
   }
-});
+);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('FFmpeg render service on ' + PORT));
+app.listen(PORT, () => console.log('Render server on ' + PORT));
