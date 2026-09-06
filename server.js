@@ -85,13 +85,15 @@ app.post(
       try { payload = JSON.parse(req.body.payload || '{}'); }
       catch (e) { cleanup(); return res.status(400).json({ error: 'BAD_PAYLOAD', detail: String(e) }); }
 
-      const duration   = Number(payload.duration) || 10;
-      const hookStart  = Number(payload.hook_start ?? 0);
-      const hookEnd    = Number(payload.hook_end ?? 2);
-      const qStart     = Number(payload.question_start ?? 2);
-      const aStart     = Number(payload.answers_start ?? 2);
-      const aStep      = Number(payload.answer_step ?? 0.3);
-      const reveal     = Number(payload.reveal_time ?? 7);
+      // Тайминги: n8n присылает их внутри payload.timings, поддержим оба варианта
+      const t = payload.timings || payload;
+      const duration   = Number(payload.duration ?? t.duration) || 10;
+      const hookStart  = Number(t.hook_start ?? 0);
+      const hookEnd    = Number(t.hook_end ?? 2);
+      const qStart     = Number(t.question_start ?? 2);
+      const aStart     = Number(t.answer_start ?? t.answers_start ?? 2);
+      const aStep      = Number(t.answer_step ?? 0.3);
+      const reveal     = Number(t.reveal_start ?? t.reveal_time ?? 7);
 
       const answers = Array.isArray(payload.answers) ? payload.answers : [];
       const correctIdx = (Number(payload.correct_answer_position) || 1) - 1;
@@ -151,20 +153,17 @@ app.post(
         const aFile = writeTextFile(work, `answer_${i}.txt`, ans);
 
         if (i === correctIdx) {
-          // до reveal — обычный цвет
           draws.push(drawtext({
             textfile: aFile, fontSize: CONFIG.answers.fontSize, y,
             color: CONFIG.answers.color, box: CONFIG.answers.box, boxborder: CONFIG.answers.boxborder,
             enable: `between(t,${appear},${reveal})`,
           }));
-          // после reveal — зелёный, до конца
           draws.push(drawtext({
             textfile: aFile, fontSize: CONFIG.answers.fontSize, y,
             color: CONFIG.answers.correctColor, box: CONFIG.answers.box, boxborder: CONFIG.answers.boxborder,
             enable: `gte(t,${reveal})`,
           }));
         } else {
-          // неправильный — виден от появления до reveal, потом исчезает
           draws.push(drawtext({
             textfile: aFile, fontSize: CONFIG.answers.fontSize, y,
             color: CONFIG.answers.color, box: CONFIG.answers.box, boxborder: CONFIG.answers.boxborder,
@@ -177,6 +176,7 @@ app.post(
 
       const args = [
         '-y',
+        '-filter_complex_threads', '1',   // ограничить потоки фильтров (память)
         ...inputs,
         '-filter_complex', fc.join(';'),
         '-map', '[v]',
@@ -184,7 +184,8 @@ app.post(
         '-t', String(duration),
         '-r', String(CONFIG.fps),
         '-c:v', 'libx264',
-        '-preset', 'veryfast',
+        '-threads', '2',                  // ограничить потоки x264 (главный фикс OOM)
+        '-preset', 'ultrafast',           // меньше памяти на lookahead
         '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
         '-b:a', '192k',
@@ -193,14 +194,18 @@ app.post(
         outPath,
       ];
 
+      console.log('FFMPEG ARGS:', args.join(' '));
+
       const ff = spawn('ffmpeg', args);
       let stderr = '';
       ff.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 20000) stderr = stderr.slice(-20000); });
 
-      ff.on('close', (code) => {
+      ff.on('close', (code, signal) => {
         if (code !== 0 || !fs.existsSync(outPath)) {
+          console.error(`FFMPEG FAILED code=${code} signal=${signal}`);
+          console.error(stderr);   // полный лог в Deploy Logs
           cleanup();
-          return res.status(500).json({ error: 'FFMPEG_FAILED', exitCode: code, detail: stderr.slice(-4000) });
+          return res.status(500).json({ error: 'FFMPEG_FAILED', exitCode: code, signal: signal || null, detail: stderr.slice(-4000) });
         }
         res.setHeader('Content-Type', 'video/mp4');
         const stream = fs.createReadStream(outPath);
@@ -210,10 +215,12 @@ app.post(
       });
 
       ff.on('error', (err) => {
+        console.error('FFMPEG SPAWN FAILED:', err);
         cleanup();
         res.status(500).json({ error: 'FFMPEG_SPAWN_FAILED', detail: String(err) });
       });
     } catch (err) {
+      console.error('INTERNAL:', err);
       cleanup();
       res.status(500).json({ error: 'INTERNAL', detail: String(err) });
     }
